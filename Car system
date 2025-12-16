@@ -1,327 +1,234 @@
-local Kart = script.Parent
+--[[ This is my Kart system.
+
+For the handling, i'm modifying physicalproperties of the wheels so that when the user drifts,
+ the rear wheels slides out, but some grip is still on the front , so you can still steer into the turn. 
+ 
+ For drifting, i tried lowering friction to get that mario kart driving feeling,
+ but it wasn't enough, so I used VectorForce and AngularVelocity to push the kart sideways and
+ rotate it. I used those to calculate the force based on how fast the kart goes, to avoid spinning out.
+ 
+ I used a custom function for the steering visuals, so that it looks like the wheels of the kart
+ rotates the shortest distance and not snapping the long way around.
+]]
+
+
+-- Services
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-local Seat = Kart:WaitForChild("Core"):WaitForChild("VehicleSeat")
-local Drifting = Kart.Core:WaitForChild("Drifting")
-local Body = Kart.Core.Body
+-- References
+local Kart = script.Parent
+local Core = Kart:WaitForChild("Core")
+local Seat = Core:WaitForChild("VehicleSeat")
+local Body = Core.Body
+local DriftingVal = Core:WaitForChild("Drifting")
+local WheelsFolder = Kart:WaitForChild("Wheels")
 
---// Data
-local KartData = require(game.ReplicatedStorage.Modules.KartData)[Kart.Name]
-local MaxSpeed = KartData["TopSpeed"]
-local Accel    = KartData["Acceleration"]
-local SteerAngle = KartData["SteerAngle"]
-local Handling   = KartData["Handling"] or 1.0
-local LastOccupant = nil
+-- External Data
+local KartModule = require(ReplicatedStorage.Modules.KartData)
+local Stats = KartModule[Kart.Name]
 
---// TUNING VARIABLES
-local DRIFT_TURN_SPEED     = 3.5 * Handling      
-local DRIFT_SLIDE_POWER    = 16000 / Handling    
-local DRIFT_BOOST_TIME_REQ = 1.2                 
-local DRIFT_BOOST_POWER    = 12000               
-local DRIFT_BOOST_DURATION = 0.6                 
+-- Tuning & Constants
+local topSpeed = Stats.TopSpeed
+local acceleration = Stats.Acceleration
+local steerAngle = Stats.SteerAngle
+local handlingMult = Stats.Handling or 1.0
 
-local MIN_DRIFT_SPEED = 25
+local driftTurnSpeed = 3.5 * handlingMult
+local driftSlidePower = 16000 / handlingMult
+local driftBoostReqTime = 1.2
+local driftBoostPower = 12000
+local driftBoostDuration = 0.6
+local minDriftSpeed = 25
 
--- Countdown / Race State
-local RaceActive = false 
+-- Physics Properties
+local normalFrontProps = PhysicalProperties.new(2, 1.2, 0, 1, 0)
+local normalRearProps = PhysicalProperties.new(2, 1.6, 0, 1, 0)
+local driftFrontProps = PhysicalProperties.new(2, 0.8, 0, 1, 0)
+local driftRearProps = PhysicalProperties.new(2, 0.8 * handlingMult, 0, 1, 0)
 
--- WHEELS / HINGES
-local Hinges = Kart:WaitForChild("Wheels"):WaitForChild("Hinges")
-local Motors = {
-	FRM = Hinges.WheelFR;
-	FLM = Hinges.WheelFL;
-	BRM = Hinges.WheelRR;
-	BLM = Hinges.WheelRL;
+-- State
+local raceActive = false
+local lastOccupant = nil
+local driftStartTime = 0
+local isDrifting = false
+
+-- Wheel Setup
+local motors = {
+	FRM = WheelsFolder.Hinges.WheelFR,
+	FLM = WheelsFolder.Hinges.WheelFL,
+	BRM = WheelsFolder.Hinges.WheelRR,
+	BLM = WheelsFolder.Hinges.WheelRL
 }
 
-local OriginalOrientations = {
-	FRM = Motors.FRM.Attachment0.Orientation;
-	FLM = Motors.FLM.Attachment0.Orientation;
+local originalOrientations = {
+	FRM = motors.FRM.Attachment0.Orientation,
+	FLM = motors.FLM.Attachment0.Orientation
 }
 
-for _, Motor in Motors do
-	Motor.MotorMaxTorque = Accel * 3 
+-- Apply torque settings
+for _, motor in pairs(motors) do
+	motor.MotorMaxTorque = acceleration * 3
 end
 
--- Wheel Colliders
-local FLWheel = Kart.Wheels.FL.WheelCollider
-local FRWheel = Kart.Wheels.FR.WheelCollider
-local RLWheelCollider = Kart.Wheels.RL.WheelCollider
-local RRWheelCollider = Kart.Wheels.RR.WheelCollider
+local wheelColliders = {
+	FL = WheelsFolder.FL.WheelCollider,
+	FR = WheelsFolder.FR.WheelCollider,
+	RL = WheelsFolder.RL.WheelCollider,
+	RR = WheelsFolder.RR.WheelCollider
+}
 
--- Friction Props
-local NORMAL_FRONT_PROPS = PhysicalProperties.new(2, 1.2, 0, 1, 0)
-local NORMAL_REAR_PROPS = PhysicalProperties.new(2, 1.6, 0, 1, 0)
-local DRIFT_FRONT_PROPS = PhysicalProperties.new(2, 0.8, 0, 1, 0) 
+-- Init Friction
+wheelColliders.FL.CustomPhysicalProperties = normalFrontProps
+wheelColliders.FR.CustomPhysicalProperties = normalFrontProps
+wheelColliders.RL.CustomPhysicalProperties = normalRearProps
+wheelColliders.RR.CustomPhysicalProperties = normalRearProps
 
-local driftRearFriction = 0.8 * Handling 
-local DRIFT_REAR_PROPS = PhysicalProperties.new(2, driftRearFriction, 0, 1, 0)
-
-FLWheel.CustomPhysicalProperties         = NORMAL_FRONT_PROPS
-FRWheel.CustomPhysicalProperties         = NORMAL_FRONT_PROPS
-RLWheelCollider.CustomPhysicalProperties = NORMAL_REAR_PROPS
-RRWheelCollider.CustomPhysicalProperties = NORMAL_REAR_PROPS
-
--- Helpers
-local frontNormalProps = NORMAL_FRONT_PROPS
-local rearNormalProps  = NORMAL_REAR_PROPS
-local frontDriftProps  = DRIFT_FRONT_PROPS
-local rearDriftProps   = DRIFT_REAR_PROPS
-
-
--- 1) STABILITY: BALLAST
-do
-	local ballast = Instance.new("Part")
-	ballast.Name = "Ballast"
-	ballast.Size = Vector3.new(2, 0.5, 3)
-	ballast.Transparency = 1
-	ballast.CanCollide = false
-	ballast.Massless = false
-	ballast.Anchored = false
-	ballast.Material = Enum.Material.Metal
-	ballast.CFrame = Body.CFrame * CFrame.new(0, -1.5, 0)
-	ballast.Parent = Kart
-
-	local weld = Instance.new("WeldConstraint")
-	weld.Part0 = Body
-	weld.Part1 = ballast
-	weld.Parent = ballast
+-- Suspension & Stability Setup
+local function createForce(name, className, parent, props)
+	local obj = Instance.new(className)
+	obj.Name = name
+	for k, v in pairs(props) do
+		obj[k] = v
+	end
+	obj.Parent = parent
+	return obj
 end
 
+-- Center of Mass adjustment (Ballast)
+local ballast = Instance.new("Part")
+ballast.Name = "Ballast"
+ballast.Size = Vector3.new(2, 0.5, 3)
+ballast.Transparency = 1
+ballast.CanCollide = false
+ballast.Massless = false
+ballast.CFrame = Body.CFrame * CFrame.new(0, -1.5, 0)
+ballast.Parent = Kart
 
--- 2) AIR STABILIZER
-local airAtt = Instance.new("Attachment")
-airAtt.Name = "AirAttachment"
-airAtt.Parent = Body
+local weld = Instance.new("WeldConstraint")
+weld.Part0 = Body
+weld.Part1 = ballast
+weld.Parent = ballast
 
-local AirStabilizer = Instance.new("AlignOrientation")
-AirStabilizer.Name = "AirStabilizer"
-AirStabilizer.Attachment0 = airAtt
-AirStabilizer.Mode = Enum.OrientationAlignmentMode.OneAttachment
-AirStabilizer.RigidityEnabled = false
+-- Stabilization Forces
+local airAtt = Instance.new("Attachment", Body)
+local driftAtt = Instance.new("Attachment", Body)
 
-AirStabilizer.Responsiveness = 5 
-AirStabilizer.MaxTorque = 50000
-AirStabilizer.Enabled = false
-AirStabilizer.Parent = Body
+local airStabilizer = createForce("AirStabilizer", "AlignOrientation", Body, {
+	Attachment0 = airAtt,
+	Mode = Enum.OrientationAlignmentMode.OneAttachment,
+	RigidityEnabled = false,
+	Responsiveness = 5,
+	MaxTorque = 50000,
+	Enabled = false
+})
 
-local FloatForce = Instance.new("VectorForce")
-FloatForce.Name = "AirFloatForce"
-FloatForce.RelativeTo = Enum.ActuatorRelativeTo.World
-FloatForce.Attachment0 = airAtt
-FloatForce.Enabled = false
-FloatForce.Parent = Body
+local airFloatForce = createForce("AirFloatForce", "VectorForce", Body, {
+	RelativeTo = Enum.ActuatorRelativeTo.World,
+	Attachment0 = airAtt,
+	Enabled = false
+})
 
-local bodyMass = Body.AssemblyMass
-local worldGravity = Workspace.Gravity
--- This controls hang time. 0.55 means you only feel 55% gravity. 
-local FLOAT_GRAVITY_SCALE = 0.55 
+local driftSlideForce = createForce("DriftSlideForce", "VectorForce", Body, {
+	Attachment0 = driftAtt,
+	RelativeTo = Enum.ActuatorRelativeTo.World,
+	Enabled = false
+})
 
+local driftTurnAssist = createForce("DriftTurnAssist", "AngularVelocity", Body, {
+	Attachment0 = driftAtt,
+	RelativeTo = Enum.ActuatorRelativeTo.World,
+	MaxTorque = 200000,
+	Enabled = false
+})
+
+local boostForce = createForce("DriftBoostForce", "VectorForce", Body, {
+	Attachment0 = driftAtt,
+	RelativeTo = Enum.ActuatorRelativeTo.World,
+	Enabled = false
+})
+
+-- Raycasting for Air Time
 local rayParams = RaycastParams.new()
 rayParams.FilterDescendantsInstances = {Kart}
 rayParams.FilterType = Enum.RaycastFilterType.Exclude
 
-local function isAirborne()
-	local origin = Body.Position
-	local dir = Vector3.new(0, -1, 0) * 6
-	local cast = workspace:Raycast(origin, dir, rayParams)
-	return cast == nil
+local function checkIsAirborne()
+	return Workspace:Raycast(Body.Position, Vector3.new(0, -6, 0), rayParams) == nil
 end
 
+-- Math Helper (Lerp angle via shortest path)
+local function shortPathLerp(current, target, alpha)
+	local diff = (target - current)
+	local corrected = Vector3.new(
+		(diff.X + 180) % 360 - 180, 
+		(diff.Y + 180) % 360 - 180, 
+		(diff.Z + 180) % 360 - 180
+	)
+	return current + corrected * alpha
+end
 
--- 3) DRIFT FORCES & BOOST
-local DriftAttachment = Instance.new("Attachment")
-DriftAttachment.Name = "DriftAttachment"
-DriftAttachment.Parent = Body
-
-local DriftSlideForce = Instance.new("VectorForce")
-DriftSlideForce.Name = "DriftSlideForce"
-DriftSlideForce.Attachment0 = DriftAttachment
-DriftSlideForce.RelativeTo = Enum.ActuatorRelativeTo.World 
-DriftSlideForce.Enabled = false
-DriftSlideForce.Parent = Body
-
-local DriftTurnAssist = Instance.new("AngularVelocity")
-DriftTurnAssist.Name = "DriftTurnAssist"
-DriftTurnAssist.Attachment0 = DriftAttachment
-DriftTurnAssist.RelativeTo = Enum.ActuatorRelativeTo.World 
-DriftTurnAssist.MaxTorque = 200000 
-DriftTurnAssist.Enabled = false
-DriftTurnAssist.Parent = Body
-
--- Smart Boost Force (World Space)
-local BoostForce = Instance.new("VectorForce")
-BoostForce.Name = "DriftBoostForce"
-BoostForce.Attachment0 = DriftAttachment
-BoostForce.RelativeTo = Enum.ActuatorRelativeTo.World 
-BoostForce.Enabled = false
-BoostForce.Parent = Body
-
--- Drift State
-local driftStartTime = 0
-local isDrifting = false
-
-
-Kart.ChildAdded:Connect(function(Child)
-	if Child.Name == "SpeedUp" then
-		MaxSpeed += 25
-		local occ = Seat.Occupant
-		if occ and occ.Parent:FindFirstChild("FOVGoal") then
-			occ.Parent.FOVGoal.Value += 10
-		end
-		if Kart.Core.Body:FindFirstChild("Boost") and Kart.Core.Body.Boost:FindFirstChild("Boost1") then
-			Kart.Core.Body.Boost.Boost1.Enabled = true
-		end
-	elseif Child.Name == "Rocket" then
-		if not Kart:FindFirstChild("Shield") then
-			local rocketProps = PhysicalProperties.new(0.6, 0.2, 0.0, 1, 0)
-			RLWheelCollider.CustomPhysicalProperties = rocketProps
-			RRWheelCollider.CustomPhysicalProperties = rocketProps
-		end
-	end
-end)
-
-Kart.ChildRemoved:Connect(function(Child)
-	if Child.Name == "SpeedUp" then
-		MaxSpeed -= 25
-		local occ = Seat.Occupant
-		if occ and occ.Parent:FindFirstChild("FOVGoal") then
-			occ.Parent.FOVGoal.Value -= 10
-		end
-		if Kart.Core.Body:FindFirstChild("Boost") and Kart.Core.Body.Boost:FindFirstChild("Boost1") then
-			Kart.Core.Body.Boost.Boost1.Enabled = false
-		end
-	elseif Child.Name == "Rocket" and not Kart:FindFirstChild("Rocket") then
-		if Drifting.Value then
-			RLWheelCollider.CustomPhysicalProperties = rearDriftProps
-			RRWheelCollider.CustomPhysicalProperties = rearDriftProps
-		else
-			RLWheelCollider.CustomPhysicalProperties = rearNormalProps
-			RRWheelCollider.CustomPhysicalProperties = rearNormalProps
-		end
-	end
-end)
-
-
--- OCCUPANT / UI
-Seat:GetPropertyChangedSignal("Occupant"):Connect(function()
-	if Seat.Occupant then
-		local plr = game.Players:GetPlayerFromCharacter(Seat.Occupant.Parent)
-		if plr then
-			LastOccupant = plr
-
-			local DriftController = game.ReplicatedStorage.Assets.DriftController:Clone()
-			DriftController:FindFirstChildWhichIsA("ObjectValue").Value = Kart
-			DriftController.Parent = plr.PlayerGui
-
-			local MainHud = game.ReplicatedStorage.Assets.MainHUD:Clone()
-			MainHud:FindFirstChildWhichIsA("ObjectValue").Value = Kart
-			MainHud.Parent = plr.PlayerGui
-		end
-	else
-		if LastOccupant then
-			if LastOccupant.PlayerGui:FindFirstChild("DriftController") then
-				LastOccupant.PlayerGui.DriftController:Destroy()
-			end
-			if LastOccupant.PlayerGui:FindFirstChild("MainHUD") then
-				LastOccupant.PlayerGui.MainHUD:Destroy()
-			end
-			LastOccupant = nil
-		end
-	end
-end)
-
-
--- VFX
-task.delay(10, function()
-	if Kart.Parent then
-		if Kart.Core.Body:FindFirstChild("DustTrails") then Kart.Core.Body.DustTrails.Dust.Enabled = true end
-		if Kart.Core.Body:FindFirstChild("DustTrails2") then Kart.Core.Body.DustTrails2.Dust.Enabled = true end
-		if Kart.Core.Body:FindFirstChild("PipesSmoke1") then Kart.Core.Body.PipesSmoke1.Smoke.Enabled = true end
-		if Kart.Core.Body:FindFirstChild("PipesSmoke2") then Kart.Core.Body.PipesSmoke2.Smoke.Enabled = true end
-	end
-end)
-
--- COUNTDOWN SYSTEM (3..2..1..GO)
+-- Race Start Logic
 task.spawn(function()
 	task.wait(3) 
-
-	print("COUNTDOWN: 3")
-	task.wait(1)
-	print("COUNTDOWN: 2")
-	task.wait(1)
-	print("COUNTDOWN: 1")
-	task.wait(1)
+	-- Simple countdown log
+	for i = 3, 1, -1 do
+		print("Starting in...", i)
+		task.wait(1)
+	end
 	print("GO!")
-
-	RaceActive = true
+	raceActive = true
 end)
 
-
-local STEER_RESPONSE = 16 
-
--- MAIN LOOP
+-- Main Physics Loop
 RunService.Heartbeat:Connect(function(dt)
-	if dt <= 0 then return end
-	if dt > 0.1 then dt = 0.1 end
+	dt = math.min(dt, 0.1) -- Prevent physics explosions on lag spikes
 
-	-- [[ RACE START LOCK ]]
-	if not RaceActive then
-		for _, Motor in Motors do
-			Motor.AngularVelocity = 0
+	if not raceActive then
+		for _, motor in pairs(motors) do
+			motor.AngularVelocity = 0
 		end
-		return 
+		return
 	end
 
-	local occupant = Seat.Occupant
-	local drifting = Drifting.Value
-	local steerVal = Seat.Steer
 	local throttle = Seat.Throttle
+	local steer = Seat.Steer
 	local speed = Body.AssemblyLinearVelocity.Magnitude
 
-	local airborne = isAirborne()
-
-	if airborne then
-		local pos = Body.Position
-
+	-- Air Mechanics
+	if checkIsAirborne() then
 		local vel = Body.AssemblyLinearVelocity
+		local look = Body.CFrame.LookVector
 
-		local targetCF
-		if vel.Magnitude > 10 then
-			-- Align with flight path
-			targetCF = CFrame.lookAt(pos, pos + vel, Vector3.new(0,1,0))
-		else
-			-- Fallback to flat if moving very slow
-			local look = Body.CFrame.LookVector
-			local flatLook = Vector3.new(look.X, 0, look.Z)
-			targetCF = CFrame.lookAt(pos, pos + flatLook, Vector3.new(0, 1, 0))
-		end
+		-- Align car to velocity if moving fast, otherwise keep flat
+		local targetCF = (vel.Magnitude > 10) 
+			and CFrame.lookAt(Body.Position, Body.Position + vel)
+			or CFrame.lookAt(Body.Position, Body.Position + Vector3.new(look.X, 0, look.Z))
 
-		AirStabilizer.CFrame = targetCF
-		AirStabilizer.Enabled = true
-		FloatForce.Force = Vector3.new(0, bodyMass * worldGravity * FLOAT_GRAVITY_SCALE, 0)
-		FloatForce.Enabled = true
+		airStabilizer.CFrame = targetCF
+		airStabilizer.Enabled = true
 
-		DriftSlideForce.Enabled = false
-		DriftTurnAssist.Enabled = false
+		-- Gravity compensation (hang time)
+		airFloatForce.Force = Vector3.new(0, Body.AssemblyMass * Workspace.Gravity * 0.55, 0)
+		airFloatForce.Enabled = true
+
+		driftSlideForce.Enabled = false
+		driftTurnAssist.Enabled = false
 	else
-		AirStabilizer.Enabled = false
-		FloatForce.Enabled = false
+		airStabilizer.Enabled = false
+		airFloatForce.Enabled = false
 
-		-- [[ DRIFT PHYSICS ]]
-		local isDrivingForward = throttle > -0.1
-		local speedRatio = math.clamp((speed - MIN_DRIFT_SPEED) / 50, 0, 1)
-		local steerMag = math.abs(steerVal)
+		-- Drift Mechanics
+		local isMovingForward = throttle > -0.1
+		local steerMag = math.abs(steer)
+		local speedRatio = math.clamp((speed - minDriftSpeed) / 50, 0, 1)
 
-		local canDrift = drifting 
-			and speed > MIN_DRIFT_SPEED 
-			and isDrivingForward 
-			and steerMag > 0.1
-
-		if canDrift then
-			DriftTurnAssist.Enabled = true
-			DriftSlideForce.Enabled = true
+		-- Check drift conditions
+		if DriftingVal.Value and speed > minDriftSpeed and isMovingForward and steerMag > 0.1 then
+			driftTurnAssist.Enabled = true
+			driftSlideForce.Enabled = true
 
 			if not isDrifting then
 				isDrifting = true
@@ -331,123 +238,107 @@ RunService.Heartbeat:Connect(function(dt)
 			local vel = Body.AssemblyLinearVelocity
 			local flatVel = Vector3.new(vel.X, 0, vel.Z)
 
+			-- Apply sideways force to simulate losing grip
+			local forceDir
 			if flatVel.Magnitude > 1 then
-				local moveDir = flatVel.Unit
-				local moveRight = moveDir:Cross(Vector3.new(0, 1, 0))
-				DriftSlideForce.Force = moveRight * (steerVal * DRIFT_SLIDE_POWER * speedRatio)
+				local moveRight = flatVel.Unit:Cross(Vector3.new(0, 1, 0))
+				forceDir = moveRight * steer
 			else
-				DriftSlideForce.Force = Body.CFrame.RightVector * (-steerVal * DRIFT_SLIDE_POWER * speedRatio)
+				forceDir = Body.CFrame.RightVector * -steer
 			end
 
-			local carUp = Body.CFrame.UpVector
-			DriftTurnAssist.AngularVelocity = carUp * (-steerVal * DRIFT_TURN_SPEED * speedRatio)
-
+			driftSlideForce.Force = forceDir * (driftSlidePower * speedRatio)
+			driftTurnAssist.AngularVelocity = Body.CFrame.UpVector * (-steer * driftTurnSpeed * speedRatio)
 		else
-			DriftTurnAssist.Enabled = false
-			DriftSlideForce.Enabled = false
-			isDrifting = false 
+			driftTurnAssist.Enabled = false
+			driftSlideForce.Enabled = false
+			isDrifting = false
 		end
 	end
 
-	-- ENGINE POWER
-	local powerFactor = 1
-	local steerMag = math.abs(Seat.Steer)
+	-- Engine Output
+	local powerFactor = (DriftingVal.Value or math.abs(steer) < 0.7) and 1 or 0.8
 
-	if drifting then
-		powerFactor = 1 
-	elseif steerMag > 0.7 then
-		powerFactor = 0.8
+	for _, motor in pairs(motors) do
+		local targetVel = topSpeed * (-throttle) * powerFactor
+		if motor:HasTag("Reverse") then targetVel *= -1 end
+		motor.AngularVelocity = targetVel
 	end
 
-	for _, Motor in Motors do
-		Motor.AngularVelocity = MaxSpeed * (-throttle) * powerFactor
-		if Motor:HasTag("Reverse") then
-			Motor.AngularVelocity *= -1
-		end
+	-- Visual Steering
+	if Seat.Occupant then
+		local speedFactor = 1 / (1 + (speed * 0.045))
+		local maxInput = (DriftingVal.Value or speed < 40) and 1.0 or (speed < 80 and 0.7 or 0.45)
+
+		local finalSteer = math.clamp(steer, -maxInput, maxInput) * speedFactor
+		local angle = steerAngle * (DriftingVal.Value and 1.5 or 1.0) * finalSteer
+		local alpha = math.clamp(dt * 16, 0, 1) -- Steer response speed
+
+		motors.FLM.Attachment0.Orientation = shortPathLerp(motors.FLM.Attachment0.Orientation, originalOrientations.FLM - Vector3.new(0, angle, 0), alpha)
+		motors.FRM.Attachment0.Orientation = shortPathLerp(motors.FRM.Attachment0.Orientation, originalOrientations.FRM - Vector3.new(0, angle, 0), alpha)
 	end
-
-	if not occupant then return end
-
-	-- STEERING VISUALS
-	local speedScale = 0.045
-	local steerFactor = 1 / (1 + (speed * speedScale))
-
-	local maxInput
-	if drifting then
-		maxInput = 1.0 
-	else
-		if speed < 40 then maxInput = 1.0
-		elseif speed < 80 then maxInput = 0.7
-		else maxInput = 0.45 end
-	end
-
-	steerVal = math.clamp(steerVal, -maxInput, maxInput)
-	local baseSteer = steerVal * steerFactor
-	local driftSteerBoost = drifting and 1.5 or 1.0 
-	local effectiveSteerAngle = SteerAngle * driftSteerBoost
-	local targetAngle = effectiveSteerAngle * baseSteer
-	local alpha = math.clamp(dt * STEER_RESPONSE, 0, 1)
-
-	local targetFLVec = OriginalOrientations.FLM + Vector3.new(0, -targetAngle, 0)
-	local targetFRVec = OriginalOrientations.FRM + Vector3.new(0, -targetAngle, 0)
-
-	local function shortPathLerp(current, target, alpha)
-		local diff = (target - current)
-		diff = Vector3.new((diff.X + 180) % 360 - 180, (diff.Y + 180) % 360 - 180, (diff.Z + 180) % 360 - 180)
-		return current + diff * alpha
-	end
-
-	Motors.FLM.Attachment0.Orientation = shortPathLerp(Motors.FLM.Attachment0.Orientation, targetFLVec, alpha)
-	Motors.FRM.Attachment0.Orientation = shortPathLerp(Motors.FRM.Attachment0.Orientation, targetFRVec, alpha)
 end)
 
--- [[ BOOST TRIGGER LOGIC ]]
-Drifting.Changed:Connect(function()
-	if Drifting.Value then
-		-- START DRIFT
-		FLWheel.CustomPhysicalProperties = frontDriftProps
-		FRWheel.CustomPhysicalProperties = frontDriftProps
-		RLWheelCollider.CustomPhysicalProperties = rearDriftProps
-		RRWheelCollider.CustomPhysicalProperties = rearDriftProps
+-- Drift Input & Boost Logic
+DriftingVal.Changed:Connect(function(isDriftingInput)
+	if isDriftingInput then
+		-- Cut friction for drift feel
+		wheelColliders.FL.CustomPhysicalProperties = driftFrontProps
+		wheelColliders.FR.CustomPhysicalProperties = driftFrontProps
+		wheelColliders.RL.CustomPhysicalProperties = driftRearProps
+		wheelColliders.RR.CustomPhysicalProperties = driftRearProps
 
 		isDrifting = true
 		driftStartTime = tick()
-
 	else
-		-- END DRIFT (Check for Boost)
-		local driftDuration = tick() - driftStartTime
+		-- Restore friction
+		wheelColliders.FL.CustomPhysicalProperties = normalFrontProps
+		wheelColliders.FR.CustomPhysicalProperties = normalFrontProps
+		wheelColliders.RL.CustomPhysicalProperties = normalRearProps
+		wheelColliders.RR.CustomPhysicalProperties = normalRearProps
 
-		if isDrifting and driftDuration >= DRIFT_BOOST_TIME_REQ then
-
+		-- Calculate Boost
+		if isDrifting and (tick() - driftStartTime >= driftBoostReqTime) then
 			local vel = Body.AssemblyLinearVelocity
 			local flatVel = Vector3.new(vel.X, 0, vel.Z)
 
-			if flatVel.Magnitude > 1 then
-				BoostForce.Force = flatVel.Unit * DRIFT_BOOST_POWER 
-			else
-				BoostForce.Force = Body.CFrame.LookVector * DRIFT_BOOST_POWER
-			end
+			boostForce.Force = (flatVel.Magnitude > 1 and flatVel.Unit or Body.CFrame.LookVector) * driftBoostPower
+			boostForce.Enabled = true
 
-			BoostForce.Enabled = true
+			-- VFX Trigger
+			local boostVFX = Core.Body:FindFirstChild("Boost")
+			if boostVFX then boostVFX.Boost1.Enabled = true end
 
-			if Kart.Core.Body:FindFirstChild("Boost") and Kart.Core.Body.Boost:FindFirstChild("Boost1") then
-				Kart.Core.Body.Boost.Boost1.Enabled = true
-			end
-
-			task.delay(DRIFT_BOOST_DURATION, function()
-				BoostForce.Enabled = false
-				if Kart.Core.Body:FindFirstChild("Boost") and Kart.Core.Body.Boost:FindFirstChild("Boost1") then
-					Kart.Core.Body.Boost.Boost1.Enabled = false
-				end
+			task.delay(driftBoostDuration, function()
+				boostForce.Enabled = false
+				if boostVFX then boostVFX.Boost1.Enabled = false end
 			end)
 		end
-
 		isDrifting = false
+	end
+end)
 
-		-- Restore Grip
-		FLWheel.CustomPhysicalProperties = frontNormalProps
-		FRWheel.CustomPhysicalProperties = frontNormalProps
-		RLWheelCollider.CustomPhysicalProperties = rearNormalProps
-		RRWheelCollider.CustomPhysicalProperties = rearNormalProps
+-- UI Connection
+Seat:GetPropertyChangedSignal("Occupant"):Connect(function()
+	local occupant = Seat.Occupant
+	if occupant then
+		local player = Players:GetPlayerFromCharacter(occupant.Parent)
+		if player then
+			lastOccupant = player
+			-- Clone UI elements
+			for _, assetName in pairs({"DriftController", "MainHUD"}) do
+				local ui = ReplicatedStorage.Assets[assetName]:Clone()
+				local objVal = ui:FindFirstChildWhichIsA("ObjectValue")
+				if objVal then objVal.Value = Kart end
+				ui.Parent = player.PlayerGui
+			end
+		end
+	elseif lastOccupant then
+		-- Cleanup UI
+		for _, uiName in pairs({"DriftController", "MainHUD"}) do
+			local ui = lastOccupant.PlayerGui:FindFirstChild(uiName)
+			if ui then ui:Destroy() end
+		end
+		lastOccupant = nil
 	end
 end)
