@@ -9,6 +9,49 @@ For the handling, i'm modifying physicalproperties of the wheels so that when th
  
  I used a custom function for the steering visuals, so that it looks like the wheels of the kart
  rotates the shortest distance and not snapping the long way around.
+
+For the state: I made variables to prevent the kart from moving before the countdown finishes. raceActive stops the kart from moving before the countdown is over,
+and driftStartTime / isDrifting calculates if the player held the drifting long enough to gain a speed boost.
+
+For WheelSetup: I listed the hinge constraints in a table , so I can loop through them later. I get the Original Orientations of the front wheel attachments,
+so that when I steer the kart it rotates relative to a particular point. Like in mario kart, the kart is at an angle when drifting.
+
+For ApplyTorque settings: This controls how easy it is for the kart to move. I set a high MotorMaxTorque based on acceleration. If its too low, the kart will have
+issues climbing up steep ramps or might even have issues moving at all. If it's high physics glitches might happen. So I just tried to make the wheels to be strong
+enough for the kart to move.
+
+For Wheel Colliders & Friction: I applied normalFrontProps and normalRearProps so that the baseline grip has high friction, so that the kart drives normally and
+doesn't slide uncontrollably, unless drifting is enabled.
+
+For Suspension & Stability: It's just a helper function I made for efficiency, so that I don't have to write new lines of code everytime I need a new physics force.
+So I just pass the data into the function to create them in one go.
+
+For Center of Mass: I created a part and named it Ballast. Its just to lower the center of gravity so that the kart stays glued to the floor and doesn't flip over
+when you hit a wall at full speed or smth.
+
+For Stabilization Forces: These are helper funcs that make the driving feel arcadish in a way, rather than realistic.
+AirStabilizer forces the kart to stay upright when it goes off a ramp, so the kart doesn't nose-down upon landing.
+AirFloatForce basically just cancels out gravity a little bit so that going off a ramp feels floaty.
+DriftSlideTurnAssist pushes the karts body sideways and rotates it when drifting for visuals.
+
+Raycast for AirTime is just to check if the kart is on the ground. I shoot a ray like 6 studs down, and if it hits nothing, then the kart is in the air.
+
+Math Helper (short path lerp) is just to ensure that the rotation takes the shortest path across the 0/360 boundary, so the wheels don't snap
+
+The main physics loop.
+Air Mechanics is just to see if the kart is in the air, then I align the kart's orientation to where its moving and turn on the float force.
+Drift Mechanics is to check if the kart is on the ground and if the drift button is held, then I calculate a VectorForce to push the kart sideways (driftSlideForce)
+based on how hard I'm steering the kart.
+Engine Output is for applying AngularVelocity to the wheel hinges to drive the kart forward.
+Visual Steering. I decoupled the visual  wheel rotation from the physics, then used a lerp function to make the wheels turn smoothly , so it doesn't snap weirdly
+to the input.
+
+Drift Input/Boost logic listens for the drift key.
+For Pressed. I swap the wheel physical properties to make it slippery so that the physics let's the kart slide.
+For Released. I swap back to high friction, then check tick() - driftStartTime. if the player drifted longer than driftBoostReqTime, i fire the boostForce to make
+the kart shoot forward.
+
+For UI Connection. It's just when a player sits in the VehicleSeat, I clone the speedometer/Drift ui into their playerGui, then when they jump out, I delete it.
 ]]
 
 
